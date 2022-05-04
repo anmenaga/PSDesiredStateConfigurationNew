@@ -1145,7 +1145,7 @@ namespace Microsoft.PowerShell.DesiredStateConfiguration.Internal.CrossPlatform
             {
                 var resourcesFound = new List<string>();
                 var exceptionList = new System.Collections.ObjectModel.Collection<Exception>();
-                LoadPowerShellClassResourcesFromModule(primaryModuleInfo: moduleInfo, moduleInfo: moduleInfo, resourcesToImport: resourcesToImport, resourcesFound: resourcesFound, errorList: exceptionList, functionsToDefine: null, recurse: true, extent: scriptExtent);
+                LoadPowerShellClassResourcesFromModule(primaryModuleInfo: moduleInfo, moduleInfo: moduleInfo, resourcesToImport: resourcesToImport, resourcesFound: resourcesFound, returnedModuleDscResourcesToExport: null, errorList: exceptionList, functionsToDefine: null, recurse: true, extent: scriptExtent);
                 foreach (Exception ex in exceptionList)
                 {
                     errorList.Add(new ParseError(scriptExtent, "ClassResourcesLoadingFailed", ex.Message));
@@ -1179,14 +1179,38 @@ namespace Microsoft.PowerShell.DesiredStateConfiguration.Internal.CrossPlatform
             PSModuleInfo moduleInfo,
             ICollection<string> resourcesToImport,
             ICollection<string> resourcesFound,
+            List<string> returnedModuleDscResourcesToExport,
             Collection<Exception> errorList,
             Dictionary<string, ScriptBlock> functionsToDefine = null,
             bool recurse = true,
             IScriptExtent extent = null)
         {
-            if (primaryModuleInfo._declaredDscResourceExports is null || primaryModuleInfo._declaredDscResourceExports.Count == 0)
+            var psd1Path = moduleInfo.Path;
+            if (!File.Exists(psd1Path))
             {
                 return;
+            }
+
+            string[] moduleDscResourcesToExport = null;
+            using (var powerShell = System.Management.Automation.PowerShell.Create())
+            {
+                powerShell.AddCommand("Import-PowerShellDataFile");
+                powerShell.AddParameter("SkipLimitCheck", true);
+                powerShell.AddParameter("Path", psd1Path);
+
+                var psd1Contents = (Hashtable)(powerShell.Invoke<Hashtable>())[0];
+
+                moduleDscResourcesToExport = (string[])System.Management.Automation.LanguagePrimitives.ConvertTo(psd1Contents["DscResourcesToExport"], typeof(string[]));
+            }
+
+            if ((moduleDscResourcesToExport == null) || (moduleDscResourcesToExport.Length == 0))
+            {
+                return;
+            }
+
+            if (returnedModuleDscResourcesToExport != null)
+            {
+                returnedModuleDscResourcesToExport.AddRange(moduleDscResourcesToExport);
             }
 
             if (moduleInfo.ModuleType == ModuleType.Binary)
@@ -1205,14 +1229,14 @@ namespace Microsoft.PowerShell.DesiredStateConfiguration.Internal.CrossPlatform
                     scriptPath = moduleInfo.Path;
                 }
 
-                LoadPowerShellClassResourcesFromModule(scriptPath, primaryModuleInfo, resourcesToImport, resourcesFound, functionsToDefine, errorList, extent);
+                LoadPowerShellClassResourcesFromModule(scriptPath, primaryModuleInfo, moduleDscResourcesToExport, resourcesToImport, resourcesFound, functionsToDefine, errorList, extent);
             }
 
             if (moduleInfo.NestedModules is not null && recurse)
             {
                 foreach (var nestedModule in moduleInfo.NestedModules)
                 {
-                    LoadPowerShellClassResourcesFromModule(primaryModuleInfo, nestedModule, resourcesToImport, resourcesFound, errorList, functionsToDefine, recurse: false, extent: extent);
+                    LoadPowerShellClassResourcesFromModule(primaryModuleInfo, nestedModule, resourcesToImport, resourcesFound, returnedModuleDscResourcesToExport, errorList, functionsToDefine, recurse: false, extent: extent);
                 }
             }
         }
@@ -1225,10 +1249,10 @@ namespace Microsoft.PowerShell.DesiredStateConfiguration.Internal.CrossPlatform
         /// <param name="functionsToDefine">Functions to define.</param>
         /// <param name="errors">List of errors to return.</param>
         /// <returns>The list of resources imported from this module.</returns>
-        public static List<string> ImportClassResourcesFromModule(PSModuleInfo moduleInfo, ICollection<string> resourcesToImport, Dictionary<string, ScriptBlock> functionsToDefine, Collection<Exception> errors)
+        public static List<string> ImportClassResourcesFromModule(PSModuleInfo moduleInfo, ICollection<string> resourcesToImport, List<string> returnedModuleDscResourcesToExport, Dictionary<string, ScriptBlock> functionsToDefine, Collection<Exception> errors)
         {
             var resourcesImported = new List<string>();
-            LoadPowerShellClassResourcesFromModule(moduleInfo, moduleInfo, resourcesToImport, resourcesImported, errors, functionsToDefine);
+            LoadPowerShellClassResourcesFromModule(moduleInfo, moduleInfo, resourcesToImport, resourcesImported, returnedModuleDscResourcesToExport, errors, functionsToDefine);
             return resourcesImported;
         }
 
@@ -1560,7 +1584,7 @@ namespace Microsoft.PowerShell.DesiredStateConfiguration.Internal.CrossPlatform
             return true;
         }
 
-        private static bool LoadPowerShellClassResourcesFromModule(string fileName, PSModuleInfo module, ICollection<string> resourcesToImport, ICollection<string> resourcesFound, Dictionary<string, ScriptBlock> functionsToDefine, Collection<Exception> errorList, IScriptExtent extent)
+        private static bool LoadPowerShellClassResourcesFromModule(string fileName, PSModuleInfo module, ICollection<string> moduleDscResourcesToExport, ICollection<string> resourcesToImport, ICollection<string> resourcesFound, Dictionary<string, ScriptBlock> functionsToDefine, Collection<Exception> errorList, IScriptExtent extent)
         {
             IEnumerable<Ast> resourceDefinitions;
             if (!GetResourceDefinitionsFromModule(fileName, out resourceDefinitions, errorList, extent))
@@ -1571,7 +1595,7 @@ namespace Microsoft.PowerShell.DesiredStateConfiguration.Internal.CrossPlatform
             var result = false;
 
             const WildcardOptions options = WildcardOptions.IgnoreCase | WildcardOptions.CultureInvariant;
-            IEnumerable<WildcardPattern> patternList = SessionStateUtilities.CreateWildcardsFromStrings(module._declaredDscResourceExports, options);
+            IEnumerable<WildcardPattern> patternList = SessionStateUtilities.CreateWildcardsFromStrings(moduleDscResourcesToExport, options);
 
             foreach (var r in resourceDefinitions)
             {

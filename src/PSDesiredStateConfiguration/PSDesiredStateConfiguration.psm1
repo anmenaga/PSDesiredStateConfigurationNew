@@ -1981,7 +1981,8 @@ function Configuration
 
             foreach ($mod in $modulesInfo) {
 
-                $null = ImportClassResourcesFromModule -Module $mod -Resources $res -functionsToDefine $functionsToDefine
+                $ModuleDscResourcesToExport = New-Object -TypeName 'System.Collections.Generic.List[string]'
+                $null = ImportClassResourcesFromModule -Module $mod -Resources $res -functionsToDefine $functionsToDefine -ModuleDscResourcesToExport $ModuleDscResourcesToExport
                 
                 if ($moduleInfos.Count -eq 1)
                 {
@@ -2393,12 +2394,15 @@ function ImportClassResourcesFromModule
         $Resources,
 
         [System.Collections.Generic.Dictionary[string, scriptblock]]
-        $functionsToDefine
+        $functionsToDefine,
+
+        [System.Collections.Generic.List[string]]
+        $ModuleDscResourcesToExport
     )
 
     $Errors = New-Object -TypeName 'System.Collections.ObjectModel.Collection[System.Exception]'
-
-    $resourcesFound = [Microsoft.PowerShell.DesiredStateConfiguration.Internal.CrossPlatform.DscClassCache]::ImportClassResourcesFromModule($Module, $Resources, $functionsToDefine, $Errors)
+    
+    $resourcesFound = [Microsoft.PowerShell.DesiredStateConfiguration.Internal.CrossPlatform.DscClassCache]::ImportClassResourcesFromModule($Module, $Resources, $ModuleDscResourcesToExport, $functionsToDefine, $Errors)
 
     foreach($ex in $Errors)
     {
@@ -3640,7 +3644,7 @@ function ReadEnvironmentFile
 function Get-DSCResourceModules
 {
     $listPSModuleFolders = $env:PSModulePath.Split([IO.Path]::PathSeparator)
-    $dscModuleFolderList = [System.Collections.Generic.HashSet[System.String]]::new()
+    $dscModulePsd1List = New-Object -TypeName 'System.Collections.Generic.List[string]'
 
     foreach ($folder in $listPSModuleFolders)
     {
@@ -3651,24 +3655,19 @@ function Get-DSCResourceModules
 
         foreach($moduleFolder in Get-ChildItem $folder -Directory)
         {
-            $addModule = $false
             foreach($psd1 in Get-ChildItem -Recurse -Filter "$($moduleFolder.Name).psd1" -Path $moduleFolder.fullname -Depth 2)
             {
                 $containsDSCResource = select-string -LiteralPath $psd1 -pattern '^[^#]*\bDscResourcesToExport\b.*'
                 if($null -ne $containsDSCResource)
                 {
-                    $addModule = $true
+                    $dscModulePsd1List.Add($psd1.FullName)
+                    break
                 }
-            }
-
-            if($addModule)
-            {
-                $dscModuleFolderList.Add($moduleFolder.Name)
             }
         }
     }
 
-    $dscModuleFolderList
+    return $dscModulePsd1List
 }
 
 function CimPropertyIsInherited
@@ -3882,7 +3881,11 @@ function Get-DscResource
         if($Module) #Pick from the specified module if there's one
         {
             $moduleSpecificName = [System.Management.Automation.LanguagePrimitives]::ConvertTo($Module,[Microsoft.PowerShell.Commands.ModuleSpecification])
-            $modules = Get-Module -ListAvailable -FullyQualifiedName $moduleSpecificName
+            $singleModuleInfo = Get-Module -ListAvailable -FullyQualifiedName $moduleSpecificName
+            if($singleModuleInfo)
+            {
+                $dscModulePsd1List = @($singleModuleInfo[0].Path)  # path to psd1
+            }
 
             if($Module -is [System.Collections.Hashtable])
             {
@@ -3899,17 +3902,23 @@ function Get-DscResource
         }
         else
         {
-            $dscResourceModules = Get-DSCResourceModules
-            if($null -ne $dscResourceModules) {
-                $modules = Get-Module -ListAvailable -Name ($dscResourceModules)
-            }
+            $dscModulePsd1List = Get-DSCResourceModules
         }
 
-        foreach ($mod in $modules)
+        $modules = @()
+        $ModuleDscResourcesToExport = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        foreach ($psd1Path in $dscModulePsd1List)
         {
-            if ($mod.ExportedDscResources.Count -gt 0)
-            {
-                $null = ImportClassResourcesFromModule -Module $mod -Resources * -functionsToDefine $functionsToDefine
+            if ($singleModuleInfo) {
+                $moduleInfo = $singleModuleInfo
+            }
+            else {
+                $moduleInfo = Get-Module -ListAvailable -Name $psd1Path
+            }
+
+            if ($moduleInfo) {
+                $null = ImportClassResourcesFromModule -Module $moduleInfo -Resources * -functionsToDefine $functionsToDefine -ModuleDscResourcesToExport $ModuleDscResourcesToExport
+                $modules += $moduleInfo
             }
         }
 
@@ -3941,7 +3950,7 @@ function Get-DscResource
 
             # Get resources for CIM cache
             $keywords = [Microsoft.PowerShell.DesiredStateConfiguration.Internal.CrossPlatform.DscClassCache]::GetKeywordsFromCachedClasses() | Where-Object -FilterScript {
-                (!$_.IsReservedKeyword) -and ($null -ne $_.ResourceName) -and !(IsHiddenResource $_.ResourceName) -and (![bool]$Module -or ($_.ImplementingModule -like $ModuleString))
+                (!$_.IsReservedKeyword) -and ($null -ne $_.ResourceName) -and ($ModuleDscResourcesToExport.Contains($_.ResourceName)) -and !(IsHiddenResource $_.ResourceName) -and (![bool]$Module -or ($_.ImplementingModule -like $ModuleString))
             }
 
             $dscResourceNames = $keywords.keyword
@@ -3953,7 +3962,6 @@ function Get-DscResource
             Where-Object -FilterScript {
                 $_ -ne $null
             }
-
             # check whether all resources are found
             CheckResourceFound $Name $Resources
         }
@@ -4050,7 +4058,7 @@ function GetResourceFromKeyword
         $_.Version -eq $keyword.ImplementingModuleVersion
     } | Select-Object -First 1
 
-    if ($Module -and $Module.ExportedDscResources -contains $keyword.Keyword)
+    if ($Module)
     {
         $resource.Module = $Module
         $resource.Path = $Module.Path
